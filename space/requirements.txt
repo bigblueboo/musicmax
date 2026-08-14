@@ -1,0 +1,6 @@
+git+https://github.com/huggingface/diffusers@82319140e0456fd58beff0a251c38825bfc310de
+transformers
+accelerate
+scipy
+spaces
+openai
