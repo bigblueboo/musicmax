@@ -1,10 +1,10 @@
 # musicmax
 
-A Colab port of the [MiniMax Music 3 Studio Space](https://huggingface.co/spaces/MiniMaxAI/MiniMax-Music3): full-song generation (lyrics + structured caption → 44.1 kHz stereo, up to 5 minutes) from the open [MiniMaxAI/MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3) weights via the diffusers `ModularPipeline`. The Space's ZeroGPU/AoTI machinery is dropped; the notebook picks a loading strategy from available VRAM instead (A100 fully on-GPU, L4 with auto CPU offload, T4 with layer-streamed LM).
+A Colab port of the [MiniMax Music 3 Studio Space](https://huggingface.co/spaces/MiniMaxAI/MiniMax-Music3): full-song generation (lyrics + structured caption → 44.1 kHz stereo, up to 5 minutes) from the open [MiniMaxAI/MiniMax-Music3](https://huggingface.co/MiniMaxAI/MiniMax-Music3) weights via the diffusers `ModularPipeline`. The Space's ZeroGPU/AoTI machinery is dropped; the notebook picks a loading strategy from available VRAM instead: A100 runs fully on GPU, L4 uses automatic CPU offload, and smaller Ampere-or-newer GPUs stream the 8B language model layer by layer. T4 is refused — it lacks native bfloat16 and its standard Colab shape lacks the host RAM the load needs.
 
 ## Run
 
-Upload `MiniMax_Music3_Colab.ipynb` at [colab.research.google.com](https://colab.research.google.com) (File → Upload notebook), switch the runtime to a GPU (A100 recommended, L4 fine; T4 is refused — pre-Ampere, no native bfloat16, and its standard shape lacks the ~30 GB host RAM the load needs), and run the cells top to bottom. A one-minute smoke-test cell validates the whole stack before you spend GPU time on a full song. Once this repo is pushed to GitHub it also opens directly:
+Upload `MiniMax_Music3_Colab.ipynb` at [colab.research.google.com](https://colab.research.google.com) (File → Upload notebook), switch the runtime to a GPU (A100 recommended; L4 is expected to fit per the model card's offload recipe, though this repo hasn't GPU-validated it; T4 is refused), and run the cells top to bottom. A one-minute smoke-test cell validates the whole stack before you spend GPU time on a full song. Once this repo is pushed to GitHub it also opens directly:
 
     https://colab.research.google.com/github/bigblueboo/musicmax/blob/main/MiniMax_Music3_Colab.ipynb
 
@@ -17,12 +17,16 @@ python3 tools/build_notebook.py        # regenerates the notebook (source of tru
 python3 tools/test_notebook.py         # dry-run: executes all cells against a mocked runtime
 ```
 
-The test suite needs only Python 3 + numpy. It statically checks cross-cell name
-resolution, executes every cell in notebook order against strict fakes (torch, diffusers,
-google.colab, gradio, openai, soundfile) across five GPU/RAM scenarios asserting saved
-files, branch selection, and UI wiring, and re-runs each inference cell in an empty
-namespace to assert it fails with the notebook's own guard message instead of a
-`NameError` — the Colab fresh-kernel case.
+The test suite needs only Python 3 + numpy. It verifies the notebook regenerates from the
+builder, statically checks cross-cell name resolution and the pinned install line, executes
+every cell in notebook order against strict fakes (torch, diffusers, google.colab, gradio,
+openai, soundfile) across a matrix of GPU/RAM scenarios and form-param variants — asserting
+offload-branch selection (including that the manager reaches `from_pretrained`), saved
+WAV+JSON pairs, sidecar contents, per-call guidance, composer failover, and UI wiring —
+and re-runs each inference cell in empty and partially-populated namespaces to assert the
+notebook's own guard message fires instead of a `NameError`. It is a control-flow dry run:
+real installs, CUDA behavior, Drive durability, and Gradio compatibility still need an
+actual Colab run.
 
 ## Layout
 
@@ -36,4 +40,4 @@ namespace to assert it fails with the notebook's own guard message instead of a
 - Pipeline knobs mirror the Space: duration 5–300 s, flow-matching steps default 30, guidance 1.7 via the `ClassifierFreeGuidance` guider, seed control.
 - Songs auto-save to a Google Drive folder (optional mount; falls back to `/content/songs`), each WAV paired with a `.json` sidecar of the seed and inputs. A seed-sweep cell batch-generates the same song across random or sequential seeds, saving each as it finishes.
 - Long songs on 24 GB GPUs are unverified; the notebook warns past 2 minutes and has a `FORCE_LM_STREAMING` escape hatch in the load cell.
-- Reviewed by GPT-5.6 Pro (expert CLI) on 2026-08-13; all P0/P1 findings addressed. Still static-only — nothing has executed on a GPU yet.
+- Reviewed twice by GPT-5.6 Pro (expert CLI, 2026-08-13/14); all P0/P1 findings addressed. Still static-only — nothing has executed on a GPU yet.

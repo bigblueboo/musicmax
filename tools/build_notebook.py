@@ -108,7 +108,7 @@ weights through the diffusers `ModularPipeline` — the same stack behind the of
 | Runtime | Fits? | Notes |
 |---|---|---|
 | A100 (40 GB) | best | everything stays on the GPU |
-| L4 (24 GB) | yes | components hop between CPU and GPU automatically; 60 s songs are the tested path — work up to long ones gradually |
+| L4 (24 GB) | should fit | components hop between CPU and GPU automatically, per the model card's offload recipe; start with 60 s songs and work up gradually |
 | T4 (16 GB) | no | pre-Ampere GPU without native bfloat16 — the notebook refuses it |
 
 Loading also passes the ~22 GB of weights through host RAM, so the runtime needs about
@@ -177,15 +177,15 @@ except Exception:
 
 code("""#@title Storage { display-mode: "form" }
 #@markdown With Drive on, every song saves to `My Drive/<drive_folder>` as a WAV plus a
-#@markdown `.json` of the exact inputs and seed that made it, and survives the runtime.
-#@markdown (Mounting pops an authorization prompt.) WAVs are ~10 MB per minute of audio.
+#@markdown `.json` of the exact inputs and seed that made it, and normally survives
+#@markdown runtime recycling. (Mounting pops an authorization prompt; if you decline it,
+#@markdown set `save_to_drive` off instead.) WAVs are ~10 MB per minute of audio.
 #@markdown With Drive off, songs go to `/content/songs` and vanish with the runtime.
 save_to_drive = True  #@param {type:"boolean"}
 drive_folder = "MiniMax-Music3"  #@param {type:"string"}
 
 import json
 import os
-import time
 
 import soundfile as sf
 
@@ -193,18 +193,27 @@ if save_to_drive:
     from google.colab import drive
 
     drive.mount("/content/drive")
-    SONGS_DIR = f"/content/drive/MyDrive/{drive_folder}"
+    _root = os.path.realpath("/content/drive/MyDrive")
+    SONGS_DIR = os.path.realpath(os.path.join(_root, drive_folder))
+    assert SONGS_DIR == _root or SONGS_DIR.startswith(_root + os.sep), \
+        "drive_folder must stay inside My Drive"
 else:
     SONGS_DIR = "/content/songs"
 os.makedirs(SONGS_DIR, exist_ok=True)
 
 
 def save_song(audio, seed, meta):
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    base = f"{SONGS_DIR}/song_{stamp}_seed{seed}"
-    sf.write(base + ".wav", audio.T, pipe.sampling_rate)
-    with open(base + ".json", "w") as f:
+    # Microsecond stamp rules out same-second name collisions; writing to .part and
+    # renaming keeps a dying runtime or a full Drive from leaving truncated files
+    # under the final names.
+    from datetime import datetime
+
+    base = f"{SONGS_DIR}/song_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}_seed{seed}"
+    sf.write(base + ".wav.part", audio.T, pipe.sampling_rate, format="WAV", subtype="PCM_16")
+    with open(base + ".json.part", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
+    os.replace(base + ".wav.part", base + ".wav")
+    os.replace(base + ".json.part", base + ".json")
     return base + ".wav"
 
 
@@ -212,13 +221,14 @@ print("Saving songs to", SONGS_DIR)""")
 
 code("""# Load the pipeline. Strategy depends on VRAM:
 #   >=28 GB (A100): everything on the GPU
-#   20-28 GB (L4):  automatic CPU offload, ~22 GB peak
-#   <20 GB:         also stream the 8B language model layer by layer (slow)
+#   22-28 GB (L4):  automatic CPU offload, ~22 GB peak per the model card
+#   <22 GB:         also stream the 8B language model layer by layer (slow)
 #
 # If a long song dies with CUDA out-of-memory: Runtime -> Restart session, set
 # FORCE_LM_STREAMING = True, and rerun from the top. (Re-running this cell without a
 # restart would load a second copy of the weights.)
 FORCE_LM_STREAMING = False
+LM_STREAMING_VRAM_GB = 22
 
 import torch
 from diffusers import ModularPipeline
@@ -237,7 +247,7 @@ else:
     manager.enable_auto_cpu_offload(device="cuda")
     pipe = ModularPipeline.from_pretrained("MiniMaxAI/MiniMax-Music3", components_manager=manager)
     pipe.load_components(dtype=torch.bfloat16)
-    if vram_gb < 20 or FORCE_LM_STREAMING:
+    if vram_gb < LM_STREAMING_VRAM_GB or FORCE_LM_STREAMING:
         from diffusers.hooks import apply_group_offloading
 
         apply_group_offloading(
@@ -250,13 +260,14 @@ else:
     else:
         print("Loaded with automatic CPU offload.")
 
+PIPE_READY = True
 print(f"Sampling rate: {pipe.sampling_rate} Hz, frame rate: {pipe.frame_rate:.0f} frames/s")""")
 
 code("""# Recommended one-minute smoke test: exercises the whole stack (language model ->
 # flow matching -> vocoder) on a 5-second, 4-step request before you commit GPU time to a
 # full song. The audio will sound rough at 4 steps — that's expected.
-assert "pipe" in globals(), (
-    "pipe is not defined — run the cells above first (install -> load). "
+assert globals().get("PIPE_READY"), (
+    "The pipeline isn't loaded — run the cells above first (install -> load). "
     "A fresh or restarted runtime starts empty, even if outputs are still visible."
 )
 
@@ -320,8 +331,11 @@ guidance_scale = 1.7  #@param {type:"slider", min:1.0, max:4.0, step:0.1}
 seed = 0  #@param {type:"integer"}
 randomize_seed = True  #@param {type:"boolean"}
 
-assert "pipe" in globals() and "save_song" in globals() and "lyrics" in globals(), (
-    "Missing setup — run the cells above first (install -> storage -> load -> song inputs). "
+_required = ("save_song", "lyrics", "global_metadata", "vocal_details", "arrangement")
+_missing = [n for n in _required if n not in globals()]
+assert globals().get("PIPE_READY") and not _missing, (
+    f"Missing setup ({', '.join(_missing) or 'pipeline load incomplete'}) — "
+    "run the cells above first (install -> storage -> load -> song inputs). "
     "A fresh or restarted runtime starts empty, even if outputs are still visible."
 )
 
@@ -399,8 +413,11 @@ base_seed = 0  #@param {type:"integer"}
 #@markdown `preview_seconds` controls the inline player per song (0 = no players, just files).
 preview_seconds = 30  #@param {type:"slider", min:0, max:60, step:5}
 
-assert "pipe" in globals() and "save_song" in globals() and "lyrics" in globals(), (
-    "Missing setup — run the cells above first (install -> storage -> load -> song inputs). "
+_required = ("save_song", "lyrics", "global_metadata", "vocal_details", "arrangement")
+_missing = [n for n in _required if n not in globals()]
+assert globals().get("PIPE_READY") and not _missing, (
+    f"Missing setup ({', '.join(_missing) or 'pipeline load incomplete'}) — "
+    "run the cells above first (install -> storage -> load -> song inputs). "
     "A fresh or restarted runtime starts empty, even if outputs are still visible."
 )
 
@@ -419,9 +436,9 @@ pipe.update_components(guider=ClassifierFreeGuidance(guidance_scale=float(sweep_
 caption = "\\n".join(s.strip() for s in (global_metadata, vocal_details, arrangement) if s.strip())
 
 if seed_mode == "random":
-    seeds = [random.randint(0, 2**32 - 1) for _ in range(num_songs)]
+    seeds = random.sample(range(2**32), k=int(num_songs))
 else:
-    seeds = [int(base_seed) + i for i in range(num_songs)]
+    seeds = [(int(base_seed) + i) % 2**32 for i in range(num_songs)]
 
 results = []
 for i, seed in enumerate(seeds, 1):
@@ -454,6 +471,7 @@ for i, seed in enumerate(seeds, 1):
     print(f"    {results[-1][1]:.1f}s of audio in {time.time() - start:.0f}s -> {path}")
     if preview_seconds:
         display(Audio(audio[:, : int(preview_seconds * pipe.sampling_rate)], rate=pipe.sampling_rate))
+    del audio
 
 print(f"\\nSweep done — {len(results)} songs:")
 for seed, secs, path in results:
@@ -543,8 +561,11 @@ using the notebook from a phone while the runtime keeps working. Caveats:
   progress in between (watch the notebook cell output for the step counter).
 - Songs save to the storage folder from the Storage cell, same as the notebook cells.""")
 
-code("""assert "pipe" in globals() and "save_song" in globals() and "lyrics" in globals(), (
-    "Missing setup — run the cells above first (install -> storage -> load -> song inputs). "
+code("""_required = ("save_song", "lyrics", "global_metadata", "vocal_details", "arrangement")
+_missing = [n for n in _required if n not in globals()]
+assert globals().get("PIPE_READY") and not _missing, (
+    f"Missing setup ({', '.join(_missing) or 'pipeline load incomplete'}) — "
+    "run the cells above first (install -> storage -> load -> song inputs). "
     "A fresh or restarted runtime starts empty, even if outputs are still visible."
 )
 
@@ -624,6 +645,12 @@ md("""## Notes
 - On 24 GB GPUs, long songs may run out of memory — the ~22 GB offloaded footprint is the
   official number for typical requests, not a five-minute guarantee. If it happens:
   Runtime → Restart session, set `FORCE_LM_STREAMING = True` in the load cell, rerun.
+- Interrupting a generation mid-flight keeps everything already saved, but the pipeline's
+  internal state after an interrupt isn't guaranteed clean — if the next run errors or
+  GPU memory stays high, restart the session.
+- Drive syncing is asynchronous: before deliberately killing a runtime right after a
+  sweep, give it a minute, or run `from google.colab import drive; drive.flush_and_unmount()`
+  in a scratch cell.
 - Weights cache in `/root/.cache/huggingface` and are gone when the runtime recycles, so
   each fresh session re-downloads ~22 GB.
 - The text prompt is capped at 5,000 tokens and audio at 9,000 frames (six minutes).
