@@ -26,5 +26,6 @@ python3 -m json.tool MiniMax_Music3_Colab.ipynb > /dev/null
 
 - diffusers support merged 2026-08-13 in [huggingface/diffusers#14456](https://github.com/huggingface/diffusers/pull/14456); the notebook pins the merge commit (`2da7040b`) until a PyPI release includes it. `transformers`/`accelerate`/`gradio` are unpinned — after the first validated Colab run, record the printed versions and pin them here.
 - Pipeline knobs mirror the Space: duration 5–300 s, flow-matching steps default 30, guidance 1.7 via the `ClassifierFreeGuidance` guider, seed control.
+- Songs auto-save to a Google Drive folder (optional mount; falls back to `/content/songs`), each WAV paired with a `.json` sidecar of the seed and inputs. A seed-sweep cell batch-generates the same song across random or sequential seeds, saving each as it finishes.
 - Long songs on 24 GB GPUs are unverified; the notebook warns past 2 minutes and has a `FORCE_LM_STREAMING` escape hatch in the load cell.
 - Reviewed by GPT-5.6 Pro (expert CLI) on 2026-08-13; all P0/P1 findings addressed. Still static-only — nothing has executed on a GPU yet.

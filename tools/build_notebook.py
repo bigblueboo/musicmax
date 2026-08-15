@@ -117,7 +117,11 @@ Loading also passes the ~22 GB of weights through host RAM, so the runtime needs
 The model is ~11B parameters across four stages (8B language model, 0.6B frame decoder,
 2.4B flow-matching transformer, vocoder). First load downloads ~22 GB of weights, which
 takes a few minutes. Budget a few minutes of GPU time per minute of audio on an A100,
-more on smaller cards.""")
+more on smaller cards.
+
+Songs save to a Google Drive folder you pick (or `/content/songs` if you skip Drive),
+each with a JSON sidecar of the seed and inputs that made it. A seed-sweep cell
+batch-generates the same song across many seeds so you can keep the best take.""")
 
 code("""# Confirm the runtime can hold the model before the long install and download.
 import os
@@ -170,6 +174,41 @@ try:
     print("HF_TOKEN set.")
 except Exception:
     print("No HF_TOKEN secret — fine for generation, the composer cell won't work.")""")
+
+code("""#@title Storage { display-mode: "form" }
+#@markdown With Drive on, every song saves to `My Drive/<drive_folder>` as a WAV plus a
+#@markdown `.json` of the exact inputs and seed that made it, and survives the runtime.
+#@markdown (Mounting pops an authorization prompt.) WAVs are ~10 MB per minute of audio.
+#@markdown With Drive off, songs go to `/content/songs` and vanish with the runtime.
+save_to_drive = True  #@param {type:"boolean"}
+drive_folder = "MiniMax-Music3"  #@param {type:"string"}
+
+import json
+import os
+import time
+
+import soundfile as sf
+
+if save_to_drive:
+    from google.colab import drive
+
+    drive.mount("/content/drive")
+    SONGS_DIR = f"/content/drive/MyDrive/{drive_folder}"
+else:
+    SONGS_DIR = "/content/songs"
+os.makedirs(SONGS_DIR, exist_ok=True)
+
+
+def save_song(audio, seed, meta):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    base = f"{SONGS_DIR}/song_{stamp}_seed{seed}"
+    sf.write(base + ".wav", audio.T, pipe.sampling_rate)
+    with open(base + ".json", "w") as f:
+        json.dump(meta, f, indent=2)
+    return base + ".wav"
+
+
+print("Saving songs to", SONGS_DIR)""")
 
 code("""# Load the pipeline. Strategy depends on VRAM:
 #   >=28 GB (A100): everything on the GPU
@@ -279,7 +318,6 @@ randomize_seed = True  #@param {type:"boolean"}
 import random
 import time
 
-import soundfile as sf
 import torch
 from diffusers.guiders import ClassifierFreeGuidance
 from IPython.display import Audio, display
@@ -308,8 +346,18 @@ audio = pipe(
 if hasattr(audio, "cpu"):
     audio = audio.float().cpu().numpy()
 
-out_path = f"/content/song_seed{seed}.wav"
-sf.write(out_path, audio.T, pipe.sampling_rate)
+out_path = save_song(audio, seed, {
+    "seed": seed,
+    "duration_requested": duration_seconds,
+    "num_inference_steps": num_inference_steps,
+    "guidance_scale": guidance_scale,
+    "audio_seconds": round(audio.shape[-1] / pipe.sampling_rate, 1),
+    "generation_seconds": round(time.time() - start),
+    "global_metadata": global_metadata,
+    "vocal_details": vocal_details,
+    "arrangement": arrangement,
+    "lyrics": lyrics,
+})
 print(f"seed {seed} — {audio.shape[-1] / pipe.sampling_rate:.1f}s of audio in {time.time() - start:.0f}s -> {out_path}")
 
 # The inline player embeds base64 PCM in the notebook (~10 MB per minute), so long songs
@@ -319,8 +367,82 @@ display(Audio(preview, rate=pipe.sampling_rate))
 if preview.shape[-1] < audio.shape[-1]:
     print(f"(player shows the first 60s — download the full song from {out_path})")""")
 
-md("""Generated files land in `/content` (folder icon in the left sidebar → right-click →
-Download). They don't survive the runtime, so download anything you want to keep.""")
+md("""Every song lands in the storage folder from the Storage cell — your Drive folder if
+you mounted it — as a WAV plus a `.json` recording the seed, settings, caption, and
+lyrics that made it. When a seed comes out great, that sidecar is how you reproduce it.
+
+## Seed sweep
+
+The same inputs give meaningfully different songs on different seeds, so the usual
+workflow is: generate a batch, listen, keep the winners. The cell below runs the current
+song inputs across several seeds. Each song saves as soon as it finishes, so stopping
+the cell (or losing the runtime) keeps everything generated up to that point. Budget GPU
+time accordingly: a 10-song sweep at 60 s each is on the order of an hour on an A100.""")
+
+code("""#@title Seed sweep — same song, many seeds { display-mode: "form" }
+num_songs = 5  #@param {type:"slider", min:2, max:20, step:1}
+sweep_duration_seconds = 60  #@param {type:"slider", min:5, max:300, step:5}
+sweep_steps = 30  #@param {type:"slider", min:4, max:60, step:1}
+sweep_guidance = 1.7  #@param {type:"slider", min:1.0, max:4.0, step:0.1}
+seed_mode = "random"  #@param ["random", "sequential from base_seed"]
+base_seed = 0  #@param {type:"integer"}
+#@markdown `preview_seconds` controls the inline player per song (0 = no players, just files).
+preview_seconds = 30  #@param {type:"slider", min:0, max:60, step:5}
+
+import random
+import time
+
+import torch
+from diffusers.guiders import ClassifierFreeGuidance
+from IPython.display import Audio, display
+
+if sweep_duration_seconds > 120 and torch.cuda.get_device_properties(0).total_memory / 1024**3 < 28:
+    print("Heads-up: songs over ~2 minutes are untested on 24 GB GPUs. If this dies with CUDA "
+          "out-of-memory, restart the runtime and set FORCE_LM_STREAMING = True in the load cell.")
+
+pipe.update_components(guider=ClassifierFreeGuidance(guidance_scale=float(sweep_guidance)))
+caption = "\\n".join(s.strip() for s in (global_metadata, vocal_details, arrangement) if s.strip())
+
+if seed_mode == "random":
+    seeds = [random.randint(0, 2**32 - 1) for _ in range(num_songs)]
+else:
+    seeds = [int(base_seed) + i for i in range(num_songs)]
+
+results = []
+for i, seed in enumerate(seeds, 1):
+    print(f"[{i}/{num_songs}] seed {seed}")
+    start = time.time()
+    audio = pipe(
+        prompt=caption,
+        lyrics=lyrics,
+        audio_duration=float(sweep_duration_seconds),
+        num_inference_steps=int(sweep_steps),
+        generator=torch.Generator("cuda").manual_seed(int(seed)),
+        output_type="np",
+        output="audios",
+    )[0]
+    if hasattr(audio, "cpu"):
+        audio = audio.float().cpu().numpy()
+    path = save_song(audio, seed, {
+        "seed": seed,
+        "duration_requested": sweep_duration_seconds,
+        "num_inference_steps": sweep_steps,
+        "guidance_scale": sweep_guidance,
+        "audio_seconds": round(audio.shape[-1] / pipe.sampling_rate, 1),
+        "generation_seconds": round(time.time() - start),
+        "global_metadata": global_metadata,
+        "vocal_details": vocal_details,
+        "arrangement": arrangement,
+        "lyrics": lyrics,
+    })
+    results.append((seed, audio.shape[-1] / pipe.sampling_rate, path))
+    print(f"    {results[-1][1]:.1f}s of audio in {time.time() - start:.0f}s -> {path}")
+    if preview_seconds:
+        display(Audio(audio[:, : int(preview_seconds * pipe.sampling_rate)], rate=pipe.sampling_rate))
+
+print(f"\\nSweep done — {len(results)} songs:")
+for seed, secs, path in results:
+    print(f"  seed {seed:>10} — {secs:5.1f}s — {path}")""")
 
 composer_system = (
     "You write inputs for MiniMax Music 3, a lyrics+description music generation model.\n"
@@ -404,9 +526,10 @@ using the notebook from a phone while the runtime keeps working. Caveats:
   your GPU. Links expire when the runtime recycles.
 - Generation is non-streaming: the player fills in when the song is done, with no
   progress in between (watch the notebook cell output for the step counter).
-- Songs live in the runtime; download anything you want to keep.""")
+- Songs save to the storage folder from the Storage cell, same as the notebook cells.""")
 
 code("""import random
+import time
 
 import gradio as gr
 import numpy as np
@@ -420,18 +543,32 @@ def ui_generate(gm, vd, arr, lyr, dur, steps, guidance, seed, randomize):
     seed = int(seed)
     pipe.update_components(guider=ClassifierFreeGuidance(guidance_scale=float(guidance)))
     caption = "\\n".join(s.strip() for s in (gm, vd, arr) if s.strip())
+    start = time.time()
     audio = pipe(
         prompt=caption,
         lyrics=lyr,
         audio_duration=float(dur),
         num_inference_steps=int(steps),
         generator=torch.Generator("cuda").manual_seed(seed),
+        output_type="np",
         output="audios",
     )[0]
     if hasattr(audio, "cpu"):
         audio = audio.float().cpu().numpy()
+    path = save_song(audio, seed, {
+        "seed": seed,
+        "duration_requested": dur,
+        "num_inference_steps": steps,
+        "guidance_scale": guidance,
+        "audio_seconds": round(audio.shape[-1] / pipe.sampling_rate, 1),
+        "generation_seconds": round(time.time() - start),
+        "global_metadata": gm,
+        "vocal_details": vd,
+        "arrangement": arr,
+        "lyrics": lyr,
+    })
     pcm = (audio.T * 32767.0).astype(np.int16)
-    return (pipe.sampling_rate, pcm), seed
+    return (pipe.sampling_rate, pcm), seed, path
 
 
 with gr.Blocks(title="MiniMax Music 3") as demo:
@@ -451,11 +588,12 @@ with gr.Blocks(title="MiniMax Music 3") as demo:
             go = gr.Button("Generate", variant="primary")
             out_audio = gr.Audio(label="Song", type="numpy")
             used_seed = gr.Number(label="Seed used", precision=0)
+            saved_to = gr.Textbox(label="Saved to", interactive=False)
 
     go.click(
         ui_generate,
         [gm_box, vd_box, arr_box, lyr_box, dur_sl, steps_sl, guid_sl, seed_box, rand_ck],
-        [out_audio, used_seed],
+        [out_audio, used_seed, saved_to],
     )
 
 demo.queue().launch(share=True)""")
