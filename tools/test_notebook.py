@@ -212,11 +212,12 @@ def strip_magics(src):
 
 class Scenario:
     def __init__(self, name, vram_gb, bf16=True, ram_gb=83, disk_gb=200, cuda=True,
-                 overrides=None, composer_script=None):
+                 overrides=None, composer_script=None, files=None):
         self.name, self.vram_gb, self.bf16, self.ram_gb, self.disk_gb, self.cuda = (
             name, vram_gb, bf16, ram_gb, disk_gb, cuda)
         self.overrides = overrides or {}
         self.composer_script = composer_script
+        self.files = files or {}
 
 
 class Registry:
@@ -490,6 +491,10 @@ def run_scenario(scenario, expect_error=None):
     print(f"[scenario] {scenario.name}")
     reg = Registry()
     sandbox = tempfile.mkdtemp(prefix="mm3-dryrun-")
+    for rel, content in scenario.files.items():
+        p = Path(sandbox) / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
     buf = io.StringIO()
     error = None
     ns = {"__name__": "__main__"}
@@ -522,10 +527,22 @@ def run_scenario(scenario, expect_error=None):
 SIDECAR_KEYS = {"seed", "duration_requested", "num_inference_steps", "guidance_scale",
                 "audio_seconds", "generation_seconds", "global_metadata", "vocal_details",
                 "arrangement", "lyrics"}
+ALBUM_SIDECAR_KEYS = SIDECAR_KEYS | {"album", "title", "take"}
+
+ALBUM_FIXTURE = {
+    "album": "Midnight Static",
+    "songs": [
+        {"title": "Neon Rain", "lyrics": "[verse]\nRain on glass", "global_metadata": "gm one",
+         "vocal_details": "vd one", "arrangement": "arr one"},
+        {"title": "Last Exit", "lyrics": "[chorus]\nLast exit glow", "global_metadata": "gm two",
+         "vocal_details": "vd two", "arrangement": "arr two",
+         "duration_seconds": 30, "num_inference_steps": 12, "guidance_scale": 2.0},
+    ],
+}
 
 
 def assert_full_run(ns, reg, sandbox, expect_manager, expect_group_offload, drive=True,
-                    expected_displays=6, sweep_seeds=None, sweep_guidance=1.7):
+                    expected_displays=6, sweep_seeds=None, sweep_guidance=1.7, album=False):
     pipe = reg.pipes[-1]
     check(len(reg.pipes) == 1, "exactly one pipeline constructed")
     check((pipe.components_manager is not None) == expect_manager,
@@ -536,8 +553,10 @@ def assert_full_run(ns, reg, sandbox, expect_manager, expect_group_offload, driv
         check(reg.group_offload_calls == [pipe.language_model], "group offloading targets pipe.language_model")
     check((pipe.device == "cuda") == (not expect_manager), "pipe.to('cuda') only on the full-GPU path")
 
-    # smoke(1) + generate(1) + sweep(5) = 7 pipeline calls before the UI
-    check(len(pipe.calls) == 7, f"pipeline called 7 times in cell order (got {len(pipe.calls)})")
+    # smoke(1) + generate(1) + sweep(5) [+ album 2 songs x 3 takes] before the UI
+    expected_calls = 7 + (6 if album else 0)
+    check(len(pipe.calls) == expected_calls,
+          f"pipeline called {expected_calls} times in cell order (got {len(pipe.calls)})")
     smoke, gen = pipe.calls[0], pipe.calls[1]
     check(smoke["audio_duration"] == 5.0 and smoke["num_inference_steps"] == 4, "smoke test uses 5s / 4 steps")
     check(gen["audio_duration"] == 60.0 and gen["num_inference_steps"] == 30, "generate uses form defaults")
@@ -549,17 +568,39 @@ def assert_full_run(ns, reg, sandbox, expect_manager, expect_group_offload, driv
     check(all(c["guidance_at_call"] == sweep_guidance for c in pipe.calls[2:7]),
           f"sweep ran at guidance {sweep_guidance}")
 
+    if album:
+        song1, song2 = pipe.calls[7:10], pipe.calls[10:13]
+        check(all(c["audio_duration"] == 120.0 and c["num_inference_steps"] == 30
+                  and c["guidance_at_call"] == 1.7 for c in song1),
+              "album song 1 used the cell-level defaults")
+        check(all(c["audio_duration"] == 30.0 and c["num_inference_steps"] == 12
+                  and c["guidance_at_call"] == 2.0 for c in song2),
+              "album song 2 used its per-song overrides")
+
     wavs = sorted(glob.glob(f"{sandbox}/**/*.wav", recursive=True))
     sidecars = sorted(glob.glob(f"{sandbox}/**/*.json", recursive=True))
     parts = glob.glob(f"{sandbox}/**/*.part", recursive=True)
-    check(len(wavs) == 6 and len(sidecars) == 6, f"generate+sweep saved 6 wav + 6 json (got {len(wavs)}/{len(sidecars)})")
+    album_wavs = [w for w in wavs if "/midnight-static/" in w]
+    base_wavs = [w for w in wavs if "/midnight-static/" not in w]
+    # sidecar count excludes the input album.json fixture, which lives outside SONGS_DIR
+    song_sidecars = [s for s in sidecars if not s.endswith("album.json")]
+    check(len(base_wavs) == 6, f"generate+sweep saved 6 wavs (got {len(base_wavs)})")
+    check(len(song_sidecars) == len(wavs), "one sidecar per wav")
+    if album:
+        check(len(album_wavs) == 6, f"album saved 2 songs x 3 takes (got {len(album_wavs)})")
+        check(sum("neon-rain_take" in w for w in album_wavs) == 3
+              and sum("last-exit_take" in w for w in album_wavs) == 3,
+              "album filenames carry slugged titles and take numbers")
+    else:
+        check(not album_wavs, "no album output without an album file")
     check(not parts, "no leftover .part files after atomic renames")
     expected_dir = "/content/drive/MyDrive/MiniMax-Music3/" if drive else "/content/songs/"
     check(all(expected_dir in w for w in wavs), f"songs saved under {expected_dir}")
-    check({w[:-4] for w in wavs} == {s[:-5] for s in sidecars}, "every wav has a same-basename json")
-    for sidecar in sidecars:
+    check({w[:-4] for w in wavs} == {s[:-5] for s in song_sidecars}, "every wav has a same-basename json")
+    for sidecar in song_sidecars:
         meta = json.loads(Path(sidecar).read_text())
-        if set(meta) != SIDECAR_KEYS or f"seed{meta['seed']}" not in Path(sidecar).stem:
+        expected_keys = ALBUM_SIDECAR_KEYS if "/midnight-static/" in sidecar else SIDECAR_KEYS
+        if set(meta) != expected_keys or f"seed{meta['seed']}" not in Path(sidecar).stem:
             check(False, f"sidecar {Path(sidecar).name}: keys/seed mismatch (got {sorted(meta)})")
             break
     else:
@@ -594,7 +635,8 @@ def assert_full_run(ns, reg, sandbox, expect_manager, expect_group_offload, driv
 
 # --- layer 3: fresh-kernel and partial-namespace guard checks --------------------
 
-GUARDED_MARKERS = ["one-minute smoke test", "#@title Generate", "#@title Seed sweep", "ui_generate"]
+GUARDED_MARKERS = ["one-minute smoke test", "#@title Generate", "#@title Seed sweep",
+                   "#@title Album", "ui_generate"]
 
 
 def guard_check(marker, cells, preset, expect_fragment, label):
@@ -678,6 +720,11 @@ def main():
         assert_full_run(*result, expect_manager=False, expect_group_offload=False,
                         expected_displays=1, sweep_seeds=[7, 8, 9, 10, 11], sweep_guidance=2.5)
 
+    result = run_scenario(Scenario("album mode", vram_gb=40,
+                                   files={"content/album.json": json.dumps(ALBUM_FIXTURE)}))
+    if result:
+        assert_full_run(*result, expect_manager=False, expect_group_offload=False, album=True)
+
     result = run_scenario(Scenario("composer failover", vram_gb=40,
                                    composer_script=["raise", "missing_keys", "ok"]))
     if result:
@@ -698,6 +745,10 @@ def main():
     run_scenario(Scenario("drive_folder traversal", vram_gb=40,
                           overrides={'drive_folder = "MiniMax-Music3"': 'drive_folder = "../../escape"'}),
                  expect_error=(AssertionError, "inside My Drive"))
+    run_scenario(Scenario("album with missing fields", vram_gb=40,
+                          files={"content/album.json": json.dumps(
+                              {"album": "Broken", "songs": [{"title": "Half a Song", "lyrics": "x"}]})}),
+                 expect_error=(AssertionError, "Fix the album JSON"))
 
     fresh_kernel_check()
 

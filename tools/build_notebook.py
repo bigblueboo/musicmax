@@ -121,7 +121,8 @@ more on smaller cards.
 
 Songs save to a Google Drive folder you pick (or `/content/songs` if you skip Drive),
 each with a JSON sidecar of the seed and inputs that made it. A seed-sweep cell
-batch-generates the same song across many seeds so you can keep the best take.""")
+batch-generates the same song across many seeds so you can keep the best take, and an
+album cell renders a whole JSON tracklist, several takes per song.""")
 
 code("""# Confirm the runtime can hold the model before the long install and download.
 import os
@@ -202,13 +203,15 @@ else:
 os.makedirs(SONGS_DIR, exist_ok=True)
 
 
-def save_song(audio, seed, meta):
+def save_song(audio, seed, meta, name="song", subdir=""):
     # Microsecond stamp rules out same-second name collisions; writing to .part and
     # renaming keeps a dying runtime or a full Drive from leaving truncated files
     # under the final names.
     from datetime import datetime
 
-    base = f"{SONGS_DIR}/song_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}_seed{seed}"
+    folder = os.path.join(SONGS_DIR, subdir) if subdir else SONGS_DIR
+    os.makedirs(folder, exist_ok=True)
+    base = f"{folder}/{name}_{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}_seed{seed}"
     sf.write(base + ".wav.part", audio.T, pipe.sampling_rate, format="WAV", subtype="PCM_16")
     with open(base + ".json.part", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -476,6 +479,137 @@ for i, seed in enumerate(seeds, 1):
 print(f"\\nSweep done — {len(results)} songs:")
 for seed, secs, path in results:
     print(f"  seed {seed:>10} — {secs:5.1f}s — {path}")""")
+
+md("""## Album mode
+
+Feed it a JSON tracklist and it renders every song several times — takes, like cutting
+an album. Upload the file via the Files sidebar, or point the path at Drive
+(`/content/drive/MyDrive/...`). The shape:
+
+```json
+{
+  "album": "Midnight Static",
+  "songs": [
+    {
+      "title": "Neon Rain",
+      "lyrics": "[verse]\\n...",
+      "global_metadata": "Basic Attributes: bpm is 92. ...",
+      "vocal_details": "Vocal Gender & Timbre: ...",
+      "arrangement": "Instrument Lifecycle Description: ...",
+      "duration_seconds": 150,
+      "num_inference_steps": 30,
+      "guidance_scale": 1.7
+    }
+  ]
+}
+```
+
+A bare list of song objects works too. `title`, `duration_seconds`,
+`num_inference_steps`, and `guidance_scale` are optional per song — anything missing
+falls back to the sliders below. Takes save to `<storage>/<album-slug>/` with the track
+title, take number, and seed in each filename, plus the usual JSON sidecar. Any LLM can
+draft the tracklist: ask for songs with these four fields (the caption format from
+"Writing the song" above) and paste the result into a file.""")
+
+code("""#@title Album mode — render a JSON tracklist, N takes per song { display-mode: "form" }
+album_json_path = "/content/album.json"  #@param {type:"string"}
+takes_per_song = 3  #@param {type:"slider", min:1, max:10, step:1}
+album_duration_seconds = 120  #@param {type:"slider", min:5, max:300, step:5}
+album_steps = 30  #@param {type:"slider", min:4, max:60, step:1}
+album_guidance = 1.7  #@param {type:"slider", min:1.0, max:4.0, step:0.1}
+#@markdown Inline players off by default — album runs are long batch jobs; audition from the storage folder.
+album_preview_seconds = 0  #@param {type:"slider", min:0, max:60, step:5}
+
+assert globals().get("PIPE_READY") and "save_song" in globals(), (
+    "Missing setup — run the cells above first (install -> storage -> load). "
+    "A fresh or restarted runtime starts empty, even if outputs are still visible."
+)
+
+import json
+import os
+import random
+import time
+
+import torch
+from diffusers.guiders import ClassifierFreeGuidance
+from IPython.display import Audio, display
+
+
+def _slug(text, fallback):
+    s = "-".join(p for p in "".join(c if c.isalnum() else "-" for c in text.lower()).split("-") if p)
+    return s[:60] or fallback
+
+
+if not os.path.exists(album_json_path):
+    print(f"No album file at {album_json_path} — upload one (see the format above) and re-run this cell.")
+else:
+    with open(album_json_path, encoding="utf-8") as f:
+        data = json.load(f)
+    album_title = ""
+    songs = data
+    if isinstance(data, dict):
+        album_title = str(data.get("album", ""))
+        songs = data.get("songs", [])
+    assert isinstance(songs, list) and songs, "The JSON must be a list of songs or {'album': ..., 'songs': [...]}."
+
+    required = ("lyrics", "global_metadata", "vocal_details", "arrangement")
+    problems = [
+        f"song {i} ({song.get('title', 'untitled')!r}): missing {', '.join(k for k in required if not str(song.get(k, '')).strip())}"
+        for i, song in enumerate(songs, 1)
+        if any(not str(song.get(k, "")).strip() for k in required)
+    ]
+    assert not problems, "Fix the album JSON first:\\n" + "\\n".join(problems)
+
+    subdir = _slug(album_title, "album") if album_title else "album"
+    total = len(songs) * int(takes_per_song)
+    print(f"Album: {album_title or '(untitled)'} — {len(songs)} songs x {takes_per_song} takes "
+          f"= {total} renders -> {os.path.join(SONGS_DIR, subdir)}")
+
+    done = 0
+    for song_index, song in enumerate(songs, 1):
+        title = str(song.get("title") or f"track-{song_index:02d}")
+        track_name = _slug(title, f"track-{song_index:02d}")
+        caption = "\\n".join(str(song[k]).strip() for k in ("global_metadata", "vocal_details", "arrangement"))
+        duration = float(song.get("duration_seconds", album_duration_seconds))
+        steps = int(song.get("num_inference_steps", album_steps))
+        guidance = float(song.get("guidance_scale", album_guidance))
+        pipe.update_components(guider=ClassifierFreeGuidance(guidance_scale=guidance))
+        for take, seed in enumerate(random.sample(range(2**32), k=int(takes_per_song)), 1):
+            done += 1
+            print(f"[{done}/{total}] {title} — take {take}, seed {seed}")
+            start = time.time()
+            audio = pipe(
+                prompt=caption,
+                lyrics=str(song["lyrics"]),
+                audio_duration=duration,
+                num_inference_steps=steps,
+                generator=torch.Generator("cuda").manual_seed(seed),
+                output_type="np",
+                output="audios",
+            )[0]
+            if hasattr(audio, "cpu"):
+                audio = audio.float().cpu().numpy()
+            path = save_song(audio, seed, {
+                "album": album_title,
+                "title": title,
+                "take": take,
+                "seed": seed,
+                "duration_requested": duration,
+                "num_inference_steps": steps,
+                "guidance_scale": guidance,
+                "audio_seconds": round(audio.shape[-1] / pipe.sampling_rate, 1),
+                "generation_seconds": round(time.time() - start),
+                "global_metadata": str(song["global_metadata"]),
+                "vocal_details": str(song["vocal_details"]),
+                "arrangement": str(song["arrangement"]),
+                "lyrics": str(song["lyrics"]),
+            }, name=f"{track_name}_take{take}", subdir=subdir)
+            print(f"    {audio.shape[-1] / pipe.sampling_rate:.1f}s in {time.time() - start:.0f}s -> {path}")
+            if album_preview_seconds:
+                display(Audio(audio[:, : int(album_preview_seconds * pipe.sampling_rate)], rate=pipe.sampling_rate))
+            del audio
+
+    print(f"\\nAlbum done — {done} renders in {os.path.join(SONGS_DIR, subdir)}")""")
 
 composer_system = (
     "You write inputs for MiniMax Music 3, a lyrics+description music generation model.\n"
