@@ -255,6 +255,11 @@ print(f"Sampling rate: {pipe.sampling_rate} Hz, frame rate: {pipe.frame_rate:.0f
 code("""# Recommended one-minute smoke test: exercises the whole stack (language model ->
 # flow matching -> vocoder) on a 5-second, 4-step request before you commit GPU time to a
 # full song. The audio will sound rough at 4 steps — that's expected.
+assert "pipe" in globals(), (
+    "pipe is not defined — run the cells above first (install -> load). "
+    "A fresh or restarted runtime starts empty, even if outputs are still visible."
+)
+
 import numpy as np
 import torch
 from diffusers.guiders import ClassifierFreeGuidance
@@ -314,6 +319,11 @@ num_inference_steps = 30  #@param {type:"slider", min:4, max:60, step:1}
 guidance_scale = 1.7  #@param {type:"slider", min:1.0, max:4.0, step:0.1}
 seed = 0  #@param {type:"integer"}
 randomize_seed = True  #@param {type:"boolean"}
+
+assert "pipe" in globals() and "save_song" in globals() and "lyrics" in globals(), (
+    "Missing setup — run the cells above first (install -> storage -> load -> song inputs). "
+    "A fresh or restarted runtime starts empty, even if outputs are still visible."
+)
 
 import random
 import time
@@ -388,6 +398,11 @@ seed_mode = "random"  #@param ["random", "sequential from base_seed"]
 base_seed = 0  #@param {type:"integer"}
 #@markdown `preview_seconds` controls the inline player per song (0 = no players, just files).
 preview_seconds = 30  #@param {type:"slider", min:0, max:60, step:5}
+
+assert "pipe" in globals() and "save_song" in globals() and "lyrics" in globals(), (
+    "Missing setup — run the cells above first (install -> storage -> load -> song inputs). "
+    "A fresh or restarted runtime starts empty, even if outputs are still visible."
+)
 
 import random
 import time
@@ -528,7 +543,12 @@ using the notebook from a phone while the runtime keeps working. Caveats:
   progress in between (watch the notebook cell output for the step counter).
 - Songs save to the storage folder from the Storage cell, same as the notebook cells.""")
 
-code("""import random
+code("""assert "pipe" in globals() and "save_song" in globals() and "lyrics" in globals(), (
+    "Missing setup — run the cells above first (install -> storage -> load -> song inputs). "
+    "A fresh or restarted runtime starts empty, even if outputs are still visible."
+)
+
+import random
 import time
 
 import gradio as gr

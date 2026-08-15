@@ -14,12 +14,20 @@ Optional Colab secret `HF_TOKEN` enables the "compose lyrics + caption from a de
 
 ```
 python3 tools/build_notebook.py        # regenerates the notebook (source of truth)
-python3 -m json.tool MiniMax_Music3_Colab.ipynb > /dev/null
+python3 tools/test_notebook.py         # dry-run: executes all cells against a mocked runtime
 ```
+
+The test suite needs only Python 3 + numpy. It statically checks cross-cell name
+resolution, executes every cell in notebook order against strict fakes (torch, diffusers,
+google.colab, gradio, openai, soundfile) across five GPU/RAM scenarios asserting saved
+files, branch selection, and UI wiring, and re-runs each inference cell in an empty
+namespace to assert it fails with the notebook's own guard message instead of a
+`NameError` — the Colab fresh-kernel case.
 
 ## Layout
 
 - `tools/build_notebook.py` — generates the notebook; edit this, not the `.ipynb`.
+- `tools/test_notebook.py` — mocked dry-run test suite for the generated notebook.
 - `space/` — reference copy of the official Space (`app.py`, model card, pinned diffusers `minimax_music3` module), fetched 2026-08-13. Not shipped anywhere.
 
 ## Notes
