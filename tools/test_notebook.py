@@ -36,6 +36,7 @@ import importlib.metadata
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -199,7 +200,7 @@ def static_check():
     check(len(installs) == 1, "exactly one pip install cell")
     if installs:
         line = next(l for l in installs[0].splitlines() if l.strip().startswith("%pip"))
-        expected = [DIFFUSERS_COMMIT, "transformers", "accelerate", "soundfile", "openai", "gradio"]
+        expected = [DIFFUSERS_COMMIT, "transformers", "accelerate", "soundfile", "openai", "gradio", "anthropic"]
         missing = [t for t in expected if t not in line]
         check(not missing, f"install line pins the diffusers commit and all packages {missing or ''}")
 
@@ -212,12 +213,13 @@ def strip_magics(src):
 
 class Scenario:
     def __init__(self, name, vram_gb, bf16=True, ram_gb=83, disk_gb=200, cuda=True,
-                 overrides=None, composer_script=None, files=None):
+                 overrides=None, composer_script=None, files=None, anthropic_key=False):
         self.name, self.vram_gb, self.bf16, self.ram_gb, self.disk_gb, self.cuda = (
             name, vram_gb, bf16, ram_gb, disk_gb, cuda)
         self.overrides = overrides or {}
         self.composer_script = composer_script
         self.files = files or {}
+        self.anthropic_key = anthropic_key
 
 
 class Registry:
@@ -229,6 +231,7 @@ class Registry:
         self.gradio_launches = []
         self.audio_displays = 0
         self.composer_calls = []
+        self.anthropic_calls = []
 
 
 class FakeGuidance:
@@ -357,11 +360,69 @@ def make_fake_modules(scenario, reg, sandbox):
 
     module("soundfile", write=sf_write)
 
+    def userdata_get(name):
+        if name == "HF_TOKEN" or (name == "ANTHROPIC_API_KEY" and scenario.anthropic_key):
+            return "dryrun-token"
+        raise KeyError(f"Secret {name} does not exist (dry-run)")
+
     colab = module("google.colab")
-    colab.userdata = types.SimpleNamespace(get=lambda name: "dryrun-token")
+    colab.userdata = types.SimpleNamespace(get=userdata_get)
     colab.drive = types.SimpleNamespace(mount=lambda p: os.makedirs(p, exist_ok=True))
     module("google", colab=colab)
     mods["google.colab"] = colab
+
+    def fake_album_json(n):
+        return json.dumps({"album": "Static Bloom", "songs": [
+            {"title": f"Signal {i}", "lyrics": "[verse]\nNeon rain on glass",
+             "global_metadata": f"gm {i}", "vocal_details": f"vd {i}",
+             "arrangement": f"arr {i}", "duration_seconds": 150 if i % 2 else 45}
+            for i in range(1, n + 1)]})
+
+    class _AnthropicStream:
+        def __init__(self, text):
+            self._text = text
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        @property
+        def text_stream(self):
+            return iter([self._text[:40], self._text[40:]])
+
+        def get_final_message(self):
+            return types.SimpleNamespace(
+                stop_reason="end_turn",
+                content=[types.SimpleNamespace(type="text", text=self._text)],
+            )
+
+    class _AnthropicMessages:
+        @staticmethod
+        def stream(model=None, max_tokens=None, system=None, output_config=None, messages=None):
+            assert isinstance(model, str) and model, "model required"
+            assert max_tokens >= 32000, f"long JSON output needs headroom, got max_tokens={max_tokens}"
+            fmt = output_config["format"]
+            assert fmt["type"] == "json_schema", fmt
+            schema = fmt["schema"]
+            song_schema = schema["properties"]["songs"]["items"]
+            assert schema["additionalProperties"] is False and song_schema["additionalProperties"] is False, \
+                "structured outputs require additionalProperties: false on every object"
+            assert set(song_schema["required"]) == {"title", "lyrics", "global_metadata",
+                                                    "vocal_details", "arrangement", "duration_seconds"}
+            assert "MiniMax Music 3" in system and "Album craft" in system
+            n = int(re.search(r"Number of tracks: (\d+)", messages[0]["content"]).group(1))
+            reg.anthropic_calls.append({"model": model, "max_tokens": max_tokens, "n": n})
+            return _AnthropicStream(fake_album_json(n))
+
+    class FakeAnthropicClient:
+        messages = _AnthropicMessages
+
+        def __init__(self, api_key=None):
+            assert api_key, "anthropic client constructed without a key"
+
+    module("anthropic", Anthropic=FakeAnthropicClient)
 
     # Composer behaviors, consumed per create() call: "ok", "raise", "missing_keys".
     script = list(scenario.composer_script) if scenario.composer_script else None
@@ -442,10 +503,14 @@ def make_fake_modules(scenario, reg, sandbox):
 def fake_environment(scenario, reg, sandbox):
     saved_modules = {}
     fake_names = ("torch", "diffusers", "diffusers.guiders", "diffusers.hooks", "soundfile",
-                  "google", "google.colab", "openai", "gradio", "IPython", "IPython.display")
+                  "google", "google.colab", "openai", "gradio", "IPython", "IPython.display",
+                  "anthropic")
     for name in fake_names:
         saved_modules[name] = sys.modules.pop(name, None)
     sys.modules.update(make_fake_modules(scenario, reg, sandbox))
+
+    # keep the host's real API keys out of the dry run (cells check os.environ first)
+    saved_env = {v: os.environ.pop(v, None) for v in ("ANTHROPIC_API_KEY", "HF_TOKEN")}
 
     real_sysconf, real_disk, real_version = os.sysconf, shutil.disk_usage, importlib.metadata.version
     page = 16384
@@ -464,6 +529,10 @@ def fake_environment(scenario, reg, sandbox):
         yield
     finally:
         os.sysconf, shutil.disk_usage, importlib.metadata.version = real_sysconf, real_disk, real_version
+        for var, value in saved_env.items():
+            os.environ.pop(var, None)
+            if value is not None:
+                os.environ[var] = value
         for name in fake_names:
             sys.modules.pop(name, None)
             if saved_modules[name] is not None:
@@ -636,7 +705,7 @@ def assert_full_run(ns, reg, sandbox, expect_manager, expect_group_offload, driv
 # --- layer 3: fresh-kernel and partial-namespace guard checks --------------------
 
 GUARDED_MARKERS = ["one-minute smoke test", "#@title Generate", "#@title Seed sweep",
-                   "#@title Album", "ui_generate"]
+                   "#@title Album mode", "ui_generate"]
 
 
 def guard_check(marker, cells, preset, expect_fragment, label):
@@ -724,6 +793,24 @@ def main():
                                    files={"content/album.json": json.dumps(ALBUM_FIXTURE)}))
     if result:
         assert_full_run(*result, expect_manager=False, expect_group_offload=False, album=True)
+
+    result = run_scenario(Scenario("claude album composer", vram_gb=40, anthropic_key=True,
+                                   overrides={"num_tracks = 6": "num_tracks = 2",
+                                              "takes_per_song = 3": "takes_per_song = 1"}))
+    if result:
+        ns, reg, sandbox = result
+        check(len(reg.anthropic_calls) == 1 and reg.anthropic_calls[0]["n"] == 2,
+              f"claude composer made one schema-constrained streaming call for 2 tracks (got {reg.anthropic_calls})")
+        album_data = json.loads((Path(sandbox) / "content/album.json").read_text())
+        check(album_data["album"] == "Static Bloom" and len(album_data["songs"]) == 2,
+              "composer wrote the album JSON the render cell reads")
+        album_wavs = sorted(glob.glob(f"{sandbox}/**/static-bloom/*.wav", recursive=True))
+        check(len(album_wavs) == 2 and any("signal-1_take1" in w for w in album_wavs),
+              f"claude-drafted album rendered with slugged titles (got {[Path(w).name for w in album_wavs]})")
+        pipe = reg.pipes[-1]
+        check([c["audio_duration"] for c in pipe.calls[7:9]] == [150.0, 45.0],
+              "per-track durations from the drafted tracklist reached the pipeline")
+        shutil.rmtree(sandbox)
 
     result = run_scenario(Scenario("composer failover", vram_gb=40,
                                    composer_script=["raise", "missing_keys", "ok"]))

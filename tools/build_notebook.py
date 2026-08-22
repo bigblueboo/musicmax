@@ -158,7 +158,7 @@ if "diffusers" in sys.modules or "transformers" in sys.modules:
     print("diffusers/transformers already imported in this kernel — after the install finishes, "
           "Runtime -> Restart session, then rerun from the top.")
 
-%pip install -q -U "git+https://github.com/huggingface/diffusers@{DIFFUSERS_COMMIT}" transformers accelerate soundfile openai gradio
+%pip install -q -U "git+https://github.com/huggingface/diffusers@{DIFFUSERS_COMMIT}" transformers accelerate soundfile openai gradio anthropic
 
 from importlib.metadata import version
 
@@ -507,9 +507,175 @@ an album. Upload the file via the Files sidebar, or point the path at Drive
 A bare list of song objects works too. `title`, `duration_seconds`,
 `num_inference_steps`, and `guidance_scale` are optional per song — anything missing
 falls back to the sliders below. Takes save to `<storage>/<album-slug>/` with the track
-title, take number, and seed in each filename, plus the usual JSON sidecar. Any LLM can
-draft the tracklist: ask for songs with these four fields (the caption format from
-"Writing the song" above) and paste the result into a file.""")
+title, take number, and seed in each filename, plus the usual JSON sidecar.
+
+Don't want to write the tracklist by hand? The next cell has Claude draft the whole
+album from a one-line concept and write the file for you (needs an `ANTHROPIC_API_KEY`
+Colab secret). Or ask any strong model yourself — the caption format is documented in
+"Writing the song" above — and paste its JSON into a file.""")
+
+ALBUM_EXAMPLE_VOCAL = {
+    "title": "Neon Meridian",
+    "lyrics": "[verse]\nSignal lights across the bay\nEvery window burns away\n[pre-chorus]\nHold on, the current's turning\n[chorus]\nWe are wire and open sky\nEvery circuit says goodbye\n[outro]",
+    "global_metadata": "Basic Attributes: bpm is 118. key is A, and scale is minor. Synth-Pop / Retrowave. Global Emotional Progression: the verse coasts on cool restraint, the pre-chorus tightens like a held breath, the chorus breaks open wide and electric, and the outro cools back into humming night air. Application Scenarios & Imagery: an empty parking garage at 2 a.m.; taillights smearing across wet asphalt. Sonics & Production Profile: a glassy, wide mix with brittle highs, scooped mids, and a round sub-bass; gated reverb on the snare, long tails on the outro.",
+    "vocal_details": "Vocal Gender & Timbre: Singer A (Female), a cool alto with a glassy upper register. Vocal Style: detached and close-miked in the verse, urgent held notes through the pre-chorus, a wide doubled belt in the chorus, wordless falling lines over the outro. Harmony/Backing Vocals: a single octave double in the chorus only. Vocal FX: short plate reverb throughout, eighth-note delay throws on chorus line endings.",
+    "arrangement": "Instrument Lifecycle Description (Primary/Secondary Layering): Primary: an analog synth bass and a pulsing eighth-note pad run the whole track. Secondary: a shimmering arpeggio enters at the pre-chorus; a sawtooth lead answers the vocal only in the chorus. Groove & Foundation Progression: a drum machine holds four-on-the-floor from the verse; open hats and a rising tom fill lift the pre-chorus; the chorus adds layered claps; the outro strips back to pad and bass. Embellishments, Textures & Spatial FX: a reverse cymbal launches each chorus; tape hiss carries the outro down.",
+    "duration_seconds": 150,
+}
+ALBUM_EXAMPLE_INSTRUMENTAL = {
+    "title": "Vapor Trail (Interlude)",
+    "lyrics": "[instrumental]",
+    "global_metadata": "Basic Attributes: bpm is 92. key is A, and scale is minor. Ambient Electronic / Interlude. Global Emotional Progression: a single held chord blooms slowly out of silence, gathers faint motion at its center, and dissolves before it resolves — a breath between heavier tracks. Application Scenarios & Imagery: fog rolling over a cooling engine; a streetlamp flickering on at dusk. Sonics & Production Profile: narrow and lo-fi at the start, opening into a wide, washed stereo field; soft highs, and no low end until the final swell.",
+    "vocal_details": "Instrumental, no vocals. A detuned synth pad carries the lead melodic role, with a faint music-box figure surfacing twice.",
+    "arrangement": "Instrument Lifecycle Description (Primary/Secondary Layering): Primary: a slowly evolving pad drone from first second to last. Secondary: a music-box melody enters at the midpoint and returns near the end; a distant sub swell appears only in the final bars. Groove & Foundation Progression: no drums; motion comes from the pad's slow filter sweep and tape wow. Embellishments, Textures & Spatial FX: vinyl crackle throughout; a long reverse swell hands off into the next track.",
+    "duration_seconds": 45,
+}
+
+album_composer_system = (
+    "You write album tracklists for MiniMax Music 3, a lyrics + structured-caption music generation model. "
+    "Given an album concept, a track count, and a target per-track duration, you produce one JSON object "
+    "describing the complete album — and nothing else.\n"
+    "\n"
+    "# Output contract\n"
+    "Return ONLY one JSON object — no prose, no markdown fences, no comments — shaped exactly like this:\n"
+    "{\n"
+    '  "album": "<album title>",\n'
+    '  "songs": [\n'
+    "    {\n"
+    '      "title": "<short, distinct track title>",\n'
+    '      "lyrics": "<tagged lyrics>",\n'
+    '      "global_metadata": "<caption paragraph>",\n'
+    '      "vocal_details": "<caption paragraph>",\n'
+    '      "arrangement": "<caption paragraph>",\n'
+    '      "duration_seconds": <integer, 5 to 300>\n'
+    "    }\n"
+    "  ]\n"
+    "}\n"
+    "The songs array holds every track in album order, one object per track, with exactly these six keys "
+    "and no others. Newlines inside strings are escaped as \\n. No trailing commas.\n"
+    "\n"
+    "# Lyrics rules (per song)\n" + LYRICS_RULES + "\n"
+    "\n"
+    "# Structured caption rules (global_metadata / vocal_details / arrangement, per song)\n"
+    + CAPTION_CONTRACT + "\n"
+    "\n"
+    "# Album craft\n"
+    "- Cohesion: give the album a recognizable identity — a shared sonic palette, recurring imagery in the "
+    "lyrics, and a thematic through-line drawn from the concept.\n"
+    "- Contrast: every track must earn its slot. Vary bpm, key, energy, vocal approach, and song structure "
+    "across the tracklist; never place two tracks with the same tempo and mood back to back.\n"
+    "- Sequencing: open strong, place a shift or breather mid-album (a short instrumental interlude is "
+    "welcome on longer albums), and close with a track that resolves the album's arc.\n"
+    "- duration_seconds: stay near the target duration by default and deviate where it serves the track — "
+    "interludes run shorter, a closer may run longer — always within 5 to 300.\n"
+    "- Titles: short and distinct, no numbering.\n"
+    "- Never reuse lyric lines or caption sentences across tracks.\n"
+    "\n"
+    "# Examples\n"
+    "Two example song objects follow. They demonstrate structure and register only — never copy their "
+    "content, genre, or imagery.\n"
+    "\n"
+    "Example song object with vocals:\n" + json.dumps(ALBUM_EXAMPLE_VOCAL, indent=2) + "\n"
+    "\n"
+    "Example song object, an instrumental interlude:\n" + json.dumps(ALBUM_EXAMPLE_INSTRUMENTAL, indent=2)
+)
+
+code('''#@title Album composer — draft the tracklist JSON with Claude { display-mode: "form" }
+#@markdown Calls Anthropic's API (add an `ANTHROPIC_API_KEY` Colab secret via the key icon and
+#@markdown enable notebook access). Writes the file the Album mode cell reads, then prints the tracklist.
+album_description = "a rain-soaked synthwave concept album about the last night shift in a dying arcade"  #@param {type:"string"}
+num_tracks = 6  #@param {type:"slider", min:2, max:12, step:1}
+target_track_seconds = 150  #@param {type:"slider", min:30, max:300, step:10}
+claude_model = "claude-opus-5"  #@param {type:"string"}
+album_json_path = "/content/album.json"  #@param {type:"string"}
+
+import json
+import os
+
+_key = os.environ.get("ANTHROPIC_API_KEY", "")
+if not _key:
+    try:
+        from google.colab import userdata
+
+        _key = userdata.get("ANTHROPIC_API_KEY")
+    except Exception:
+        _key = ""
+
+# The response is constrained to this schema server-side (structured outputs), so the
+# JSON always parses and always has these keys. Exact track count and duration ranges
+# aren't expressible in the schema subset — those are checked below.
+ALBUM_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "album": {"type": "string"},
+        "songs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "lyrics": {"type": "string"},
+                    "global_metadata": {"type": "string"},
+                    "vocal_details": {"type": "string"},
+                    "arrangement": {"type": "string"},
+                    "duration_seconds": {"type": "integer"},
+                },
+                "required": ["title", "lyrics", "global_metadata", "vocal_details",
+                             "arrangement", "duration_seconds"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["album", "songs"],
+    "additionalProperties": False,
+}
+
+ALBUM_COMPOSER_SYSTEM = """''' + album_composer_system + '''"""
+
+if not _key:
+    print("No Anthropic API key — add an ANTHROPIC_API_KEY secret in the key sidebar "
+          "(with notebook access enabled), then re-run this cell.")
+else:
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=_key)
+    received = 0
+    with client.messages.stream(
+        model=claude_model,
+        max_tokens=64000,
+        system=ALBUM_COMPOSER_SYSTEM,
+        output_config={"format": {"type": "json_schema", "schema": ALBUM_SCHEMA}},
+        messages=[{
+            "role": "user",
+            "content": (
+                f"Album concept: {album_description}\\n"
+                f"Number of tracks: {int(num_tracks)} — the songs array must contain exactly this many objects.\\n"
+                f"Target duration per track: about {int(target_track_seconds)} seconds; vary it where that serves the album."
+            ),
+        }],
+    ) as stream:
+        for chunk in stream.text_stream:
+            received += len(chunk)
+            print(f"\\rcomposing... {received:,} characters", end="", flush=True)
+        message = stream.get_final_message()
+    print()
+
+    assert message.stop_reason == "end_turn", (
+        f"Generation stopped with {message.stop_reason!r} — "
+        + ("lower the track count." if message.stop_reason == "max_tokens" else "re-run or reword the concept.")
+    )
+    data = json.loads(next(b.text for b in message.content if b.type == "text"))
+    songs = data["songs"]
+    assert len(songs) == int(num_tracks), f"Asked for {num_tracks} tracks, got {len(songs)} — re-run this cell."
+    for song in songs:
+        song["duration_seconds"] = max(5, min(300, int(song["duration_seconds"])))
+
+    with open(album_json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    print(f"Album: {data['album']} — {len(songs)} tracks -> {album_json_path}")
+    for index, song in enumerate(songs, 1):
+        print(f"  {index:02d}. {song['title']} ({song['duration_seconds']}s)")
+    print("\\nNow run the Album mode cell below.")''')
 
 code("""#@title Album mode — render a JSON tracklist, N takes per song { display-mode: "form" }
 album_json_path = "/content/album.json"  #@param {type:"string"}

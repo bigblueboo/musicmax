@@ -8,7 +8,7 @@ Upload `MiniMax_Music3_Colab.ipynb` at [colab.research.google.com](https://colab
 
     https://colab.research.google.com/github/bigblueboo/musicmax/blob/main/MiniMax_Music3_Colab.ipynb
 
-Optional Colab secret `HF_TOKEN` enables the "compose lyrics + caption from a description" cell (Hugging Face inference router) and avoids anonymous download throttling.
+Optional Colab secrets: `HF_TOKEN` enables the "compose lyrics + caption from a description" cell (Hugging Face inference router) and avoids anonymous download throttling; `ANTHROPIC_API_KEY` enables the album composer cell, which has Claude draft a whole tracklist JSON from a one-line concept.
 
 ## Quality gates
 
@@ -40,5 +40,6 @@ actual Colab run.
 - Pipeline knobs mirror the Space: duration 5–300 s, flow-matching steps default 30, guidance 1.7 via the `ClassifierFreeGuidance` guider, seed control.
 - Songs auto-save to a Google Drive folder (optional mount; falls back to `/content/songs`), each WAV paired with a `.json` sidecar of the seed and inputs. A seed-sweep cell batch-generates the same song across random or sequential seeds, saving each as it finishes.
 - Album mode: point a cell at a JSON tracklist (`{"album": ..., "songs": [{title, lyrics, global_metadata, vocal_details, arrangement, optional per-song duration/steps/guidance}]}`) and it renders every song N times into `<storage>/<album-slug>/`, title + take + seed in each filename.
+- Album composer: a cell that calls Claude (`claude-opus-5`, Anthropic Messages API with streaming + structured outputs, so the JSON is schema-guaranteed) to draft that tracklist from an album concept — the system prompt embeds the Space's lyric/caption contracts, album-craft rules, and two in-schema examples.
 - Long songs on 24 GB GPUs are unverified; the notebook warns past 2 minutes and has a `FORCE_LM_STREAMING` escape hatch in the load cell.
 - Reviewed twice by GPT-5.6 Pro (expert CLI, 2026-08-13/14); all P0/P1 findings addressed. Still static-only — nothing has executed on a GPU yet.
