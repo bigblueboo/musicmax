@@ -413,8 +413,33 @@ def make_fake_modules(scenario, reg, sandbox):
                                                     "vocal_details", "arrangement", "duration_seconds"}
             assert "MiniMax Music 3" in system and "Album craft" in system
             n = int(re.search(r"Number of tracks: (\d+)", messages[0]["content"]).group(1))
-            reg.anthropic_calls.append({"model": model, "max_tokens": max_tokens, "n": n})
+            reg.anthropic_calls.append({"kind": "album", "model": model, "max_tokens": max_tokens, "n": n})
             return _AnthropicStream(fake_album_json(n))
+
+        @staticmethod
+        def create(model=None, max_tokens=None, system=None, output_config=None, messages=None):
+            assert isinstance(model, str) and model, "model required"
+            assert max_tokens >= 8000, f"song + thinking need headroom, got max_tokens={max_tokens}"
+            fmt = output_config["format"]
+            assert fmt["type"] == "json_schema", fmt
+            schema = fmt["schema"]
+            assert schema["additionalProperties"] is False
+            assert set(schema["required"]) == {"lyrics", "global_metadata", "vocal_details", "arrangement"}
+            assert "MiniMax Music 3" in system and "# Revisions" in system
+            user = messages[0]["content"]
+            revised = "Revision notes:" in user
+            if revised:
+                assert "Current song:" in user, "revision request must carry the current song"
+            reg.anthropic_calls.append({"kind": "song", "model": model, "revised": revised,
+                                        "saw_current_lyrics": "Riding on a beam" in user})
+            payload = {
+                "lyrics": "[chorus]\nRevised chorus line" if revised else "[verse]\nFresh drafted line",
+                "global_metadata": "song gm", "vocal_details": "song vd", "arrangement": "song arr",
+            }
+            return types.SimpleNamespace(
+                stop_reason="end_turn",
+                content=[types.SimpleNamespace(type="text", text=json.dumps(payload))],
+            )
 
     class FakeAnthropicClient:
         messages = _AnthropicMessages
@@ -799,8 +824,14 @@ def main():
                                               "takes_per_song = 3": "takes_per_song = 1"}))
     if result:
         ns, reg, sandbox = result
-        check(len(reg.anthropic_calls) == 1 and reg.anthropic_calls[0]["n"] == 2,
-              f"claude composer made one schema-constrained streaming call for 2 tracks (got {reg.anthropic_calls})")
+        song_calls = [c for c in reg.anthropic_calls if c["kind"] == "song"]
+        album_calls = [c for c in reg.anthropic_calls if c["kind"] == "album"]
+        check(len(song_calls) == 1 and not song_calls[0]["revised"],
+              "song composer made one fresh-compose call")
+        check(reg.pipes[-1].calls[1]["lyrics"] == "[verse]\nFresh drafted line",
+              "generate ran with the claude-drafted song")
+        check(len(album_calls) == 1 and album_calls[0]["n"] == 2,
+              f"album composer made one schema-constrained streaming call for 2 tracks (got {album_calls})")
         album_data = json.loads((Path(sandbox) / "content/album.json").read_text())
         check(album_data["album"] == "Static Bloom" and len(album_data["songs"]) == 2,
               "composer wrote the album JSON the render cell reads")
@@ -810,6 +841,19 @@ def main():
         pipe = reg.pipes[-1]
         check([c["audio_duration"] for c in pipe.calls[7:9]] == [150.0, 45.0],
               "per-track durations from the drafted tracklist reached the pipeline")
+        shutil.rmtree(sandbox)
+
+    result = run_scenario(Scenario("claude song revision", vram_gb=40, anthropic_key=True,
+                                   overrides={'revision_notes = ""': 'revision_notes = "punchier chorus"',
+                                              "num_tracks = 6": "num_tracks = 2",
+                                              "takes_per_song = 3": "takes_per_song = 1"}))
+    if result:
+        ns, reg, sandbox = result
+        song_calls = [c for c in reg.anthropic_calls if c["kind"] == "song"]
+        check(len(song_calls) == 1 and song_calls[0]["revised"] and song_calls[0]["saw_current_lyrics"],
+              "revision request carried the current song inputs to Claude")
+        check(reg.pipes[-1].calls[1]["lyrics"] == "[chorus]\nRevised chorus line",
+              "generate ran with the revised song")
         shutil.rmtree(sandbox)
 
     result = run_scenario(Scenario("composer failover", vram_gb=40,
